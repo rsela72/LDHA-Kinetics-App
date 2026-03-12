@@ -204,16 +204,23 @@ if files:
             v_vals = np.array([r['v0_um_s'] for r in final_results])
 
             try:
-                popt, _ = curve_fit(michaelis_menten, s_vals, v_vals, p0=[max(v_vals), 1.0])
+                popt, pcov = curve_fit(michaelis_menten, s_vals, v_vals, p0=[max(v_vals), 1.0])
                 vmax, km = popt
+                perr = np.sqrt(np.diag(pcov))
+
+                vmax_err = perr[0]
+                km_err = perr[1]
 
                 col_res1, col_res2, col_res3 = st.columns(3)
-                col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} mM")
-                col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} µM/s")
+                col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} ± {km_err:.3f} mM")
+                col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} ± {vmax_err:.3f} µM/s")
 
                 if ENZYME_CONCENTRATION > 0:
                     kcat = vmax / ENZYME_CONCENTRATION
-                    col_res3.metric("Kcat (Turnover Number)", f"{kcat:.3f} s⁻¹")
+                    # Error propagation for Kcat = Vmax / [E]
+                    # Assuming enzyme concentration has negligible error compared to Vmax
+                    kcat_err = kcat * (vmax_err / vmax)
+                    col_res3.metric("Kcat (Turnover Number)", f"{kcat:.3f} ± {kcat_err:.3f} s⁻¹")
                 else:
                     col_res3.metric("Kcat (Turnover Number)", "N/A (Enter enzyme conc.)")
 

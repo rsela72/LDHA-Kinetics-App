@@ -242,3 +242,5 @@ if files:
 else:
     st.write("---")
     st.info("☝️ Please upload some CSV files to begin.")
+
+st.markdown("<p style='font-size: small;'>Roee Sela '27</p>", unsafe_allow_html=True)

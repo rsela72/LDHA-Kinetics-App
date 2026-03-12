@@ -157,87 +157,107 @@ if files:
                 "R²": round(r['r2'], 4)
             })
 
-        edited_df = st.data_editor(pd.DataFrame(summary_data), hide_index=True, use_container_width=True)
+        edited_df = st.data_editor(
+            pd.DataFrame(summary_data),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Pyruvate (mM)": st.column_config.NumberColumn(
+                    "Pyruvate (mM)",
+                    format="%.3f",
+                    disabled=False
+                )
+            }
+        )
 
         # Filter included runs
         included_filenames = edited_df[edited_df["Include"] == True]["File"].tolist()
+        # Update pyruvate concentrations based on edited_df for included runs
+        for i, row in edited_df.iterrows():
+            for run in all_runs:
+                if run['filename'] == row['File']:
+                    run['pyruvate'] = row['Pyruvate (mM)']
+                    break
+
         final_results = [r for r in all_runs if r['filename'] in included_filenames]
 
-        # 2. CALCULATIONS BREAKDOWN
-        with st.expander("📝 View Detailed Calculations"):
-            st.latex(r"V_0 (\mu M/s) = \frac{|\Delta Abs/min|}{\epsilon \cdot l} \cdot \frac{10^6}{60}")
-            calc_table = []
-            for r in final_results:
-                calc_table.append({
-                    "Substrate [S]": f"{r['pyruvate']} mM",
-                    "Slope (Abs/min)": round(r['slope_abs_min'], 6),
-                    "Step 1: (Slope / ε)": f"{r['slope_abs_min']/EPSILON:.2e} M/min",
-                    "Final V0": f"{r['v0_um_s']:.4f} µM/s"
-                })
-            st.table(calc_table)
+        # Add a button to trigger MM calculation
+        if st.button("Calculate Michaelis-Menten Kinetics"):
+            # 2. CALCULATIONS BREAKDOWN
+            with st.expander("📝 View Detailed Calculations"):
+                st.latex(r"V_0 (\mu M/s) = \frac{|\Delta Abs/min|}{\epsilon \cdot l} \cdot \frac{10^6}{60}")
+                calc_table = []
+                for r in final_results:
+                    calc_table.append({
+                        "Substrate [S]": f"{r['pyruvate']} mM",
+                        "Slope (Abs/min)": round(r['slope_abs_min'], 6),
+                        "Step 1: (Slope / ε)": f"{r['slope_abs_min']/EPSILON:.2e} M/min",
+                        "Final V0": f"{r['v0_um_s']:.4f} µM/s"
+                    })
+                st.table(calc_table)
 
-        # 3. INDIVIDUAL V0 PLOTS
-        st.divider()
-        st.subheader("📈 Individual Run Fits")
-        cols = st.columns(2)
-        for idx, r in enumerate(all_runs):
-            with cols[idx % 2].expander(f"Run: {r['pyruvate']} mM Pyruvate ({r['filename']})", expanded=False):
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.5))
-                # Plot 1: Full
-                ax1.plot(r['full_df']['Time'], r['full_df']['Abs'], color='gray', alpha=0.5)
-                ax1.axvline(r['as_time'], color='g', linestyle='--', label='Start')
-                ax1.axvline(r['ae_time'], color='r', linestyle='--', label='End')
-                ax1.set_title("Full Assay")
-                # Plot 2: Fit
-                ax2.scatter(r['v0_data']['Time'], r['v0_data']['Abs'], s=5, color='orange')
-                t = r['v0_data']['Time']
-                ax2.plot(t, r['slope_abs_min'] * t + r['intercept'], color='blue', lw=1)
-                ax2.set_title(f"V0 Slope (R²={r['r2']:.4f})")
-                st.pyplot(fig)
-
-        # 4. MICHAELIS-MENTEN FIT
-        if len(final_results) >= 3:
+            # 3. INDIVIDUAL V0 PLOTS
             st.divider()
-            st.subheader("🧪 Michaelis-Menten Kinetic Fit")
+            st.subheader("📈 Individual Run Fits")
+            cols = st.columns(2)
+            for idx, r in enumerate(all_runs):
+                with cols[idx % 2].expander(f"Run: {r['pyruvate']} mM Pyruvate ({r['filename']})", expanded=False):
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.5))
+                    # Plot 1: Full
+                    ax1.plot(r['full_df']['Time'], r['full_df']['Abs'], color='gray', alpha=0.5)
+                    ax1.axvline(r['as_time'], color='g', linestyle='--', label='Start')
+                    ax1.axvline(r['ae_time'], color='r', linestyle='--', label='End')
+                    ax1.set_title("Full Assay")
+                    # Plot 2: Fit
+                    ax2.scatter(r['v0_data']['Time'], r['v0_data']['Abs'], s=5, color='orange')
+                    t = r['v0_data']['Time']
+                    ax2.plot(t, r['slope_abs_min'] * t + r['intercept'], color='blue', lw=1)
+                    ax2.set_title(f"V0 Slope (R²={r['r2']:.4f})")
+                    st.pyplot(fig)
 
-            s_vals = np.array([r['pyruvate'] for r in final_results])
-            v_vals = np.array([r['v0_um_s'] for r in final_results])
+            # 4. MICHAELIS-MENTEN FIT
+            if len(final_results) >= 3:
+                st.divider()
+                st.subheader("🧪 Michaelis-Menten Kinetic Fit")
 
-            try:
-                popt, pcov = curve_fit(michaelis_menten, s_vals, v_vals, p0=[max(v_vals), 1.0])
-                vmax, km = popt
-                perr = np.sqrt(np.diag(pcov))
+                s_vals = np.array([r['pyruvate'] for r in final_results])
+                v_vals = np.array([r['v0_um_s'] for r in final_results])
 
-                vmax_err = perr[0]
-                km_err = perr[1]
+                try:
+                    popt, pcov = curve_fit(michaelis_menten, s_vals, v_vals, p0=[max(v_vals), 1.0])
+                    vmax, km = popt
+                    perr = np.sqrt(np.diag(pcov))
 
-                col_res1, col_res2, col_res3 = st.columns(3)
-                col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} ± {km_err:.3f} mM")
-                col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} ± {vmax_err:.3f} µM/s")
+                    vmax_err = perr[0]
+                    km_err = perr[1]
 
-                if ENZYME_CONCENTRATION > 0:
-                    kcat = vmax / ENZYME_CONCENTRATION
-                    # Error propagation for Kcat = Vmax / [E]
-                    # Assuming enzyme concentration has negligible error compared to Vmax
-                    kcat_err = kcat * (vmax_err / vmax)
-                    col_res3.metric("Kcat (Turnover Number)", f"{kcat:.3f} ± {kcat_err:.3f} s⁻¹")
-                else:
-                    col_res3.metric("Kcat (Turnover Number)", "N/A (Enter enzyme conc.)")
+                    col_res1, col_res2, col_res3 = st.columns(3)
+                    col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} \u00B1 {km_err:.3f} mM")
+                    col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} \u00B1 {vmax_err:.3f} \u00B5M/s")
 
-                fig_mm, ax_mm = plt.subplots(figsize=(8, 5))
-                s_plot = np.linspace(0, max(s_vals)*1.2, 100)
-                ax_mm.scatter(s_vals, v_vals, color='red', label='Experimental Data', zorder=5)
-                ax_mm.plot(s_plot, michaelis_menten(s_plot, *popt), label=f'MM Fit ($K_m$={km:.2f})', color='black')
-                ax_mm.set_xlabel("Pyruvate Concentration [mM]")
-                ax_mm.set_ylabel("Initial Velocity $V_0$ [µM/s]")
-                ax_mm.legend()
-                ax_mm.grid(True, which='both', linestyle='--', alpha=0.5)
-                st.pyplot(fig_mm)
+                    if ENZYME_CONCENTRATION > 0:
+                        kcat = vmax / ENZYME_CONCENTRATION
+                        # Error propagation for Kcat = Vmax / [E]
+                        # Assuming enzyme concentration has negligible error compared to Vmax
+                        kcat_err = kcat * (vmax_err / vmax)
+                        col_res3.metric("Kcat (Turnover Number)", f"{kcat:.3f} \u00B1 {kcat_err:.3f} s⁻¹")
+                    else:
+                        col_res3.metric("Kcat (Turnover Number)", "N/A (Enter enzyme conc.)")
 
-            except Exception as e:
-                st.error(f"Could not fit Michaelis-Menten curve. Ensure you have enough data points. Error: {e}")
-        else:
-            st.warning("Please include at least 3 runs to perform Michaelis-Menten fitting.")
+                    fig_mm, ax_mm = plt.subplots(figsize=(6.8, 4.25))
+                    s_plot = np.linspace(0, max(s_vals)*1.2, 100)
+                    ax_mm.scatter(s_vals, v_vals, color='red', label='Experimental Data', zorder=5)
+                    ax_mm.plot(s_plot, michaelis_menten(s_plot, *popt), label=f'MM Fit ($K_m$={km:.2f})', color='black')
+                    ax_mm.set_xlabel("Pyruvate Concentration [mM]")
+                    ax_mm.set_ylabel("Initial Velocity $V_0$ [µM/s]")
+                    ax_mm.legend()
+                    ax_mm.grid(True, which='both', linestyle='--', alpha=0.5)
+                    st.pyplot(fig_mm)
+
+                except Exception as e:
+                    st.error(f"Could not fit Michaelis-Menten curve. Ensure you have enough data points. Error: {e}")
+            else:
+                st.warning("Please include at least 3 runs to perform Michaelis-Menten fitting.")
 
 else:
     st.write("---")

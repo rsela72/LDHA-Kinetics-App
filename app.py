@@ -231,7 +231,18 @@ if files:
                     ax2.scatter(r['v0_data']['Time'], r['v0_data']['Abs'], s=5, color='orange')
                     t = r['v0_data']['Time']
                     ax2.plot(t, r['slope_abs_min'] * t + r['intercept'], color='blue', lw=1)
-                    ax2.set_title(f"V0 Slope (R²={r['r2']:.4f}, [S]={r['pyruvate']} mM, Enzyme: {r['enzyme_type']})") # Added pyruvate concentration and Enzyme Type
+                    
+                    # Individual V0 Plot text
+                    v0_plot_text = (
+                        f"R² = {r['r2']:.4f}\n"
+                        f"V0 = {r['v0_um_s']:.4f} µM/s\n"
+                        f"[S] = {r['pyruvate']} mM\n"
+                        f"Enzyme: {r['enzyme_type']}"
+                    )
+                    ax2.text(0.95, 0.95, v0_plot_text, transform=ax2.transAxes, fontsize=8, 
+                             verticalalignment='top', horizontalalignment='right', 
+                             bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.5))
+                    ax2.set_title("V0 Fit")
                     st.pyplot(fig)
 
             # 4. MICHAELIS-MENTEN FIT
@@ -256,7 +267,7 @@ if files:
 
                     col_res1, col_res2, col_res3 = st.columns(3)
                     col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} ± {km_err:.3f} mM")
-                    col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} ± {vmax_err:.3f} µM/s")
+                    col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} ± {vmax_err:.3f} \u00B5M/s")
 
                     plot_text = f"Km = {km:.3f} ± {km_err:.3f} mM\nVmax = {vmax:.3f} ± {vmax_err:.3f} \u00B5M/s"
                     if ENZYME_CONCENTRATION > 0:

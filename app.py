@@ -104,8 +104,19 @@ def calculate_kinetics(df, filename):
     abs_slope = abs(final_reg.slope)
     v0_um_s = (abs_slope / (EPSILON * PATH_LENGTH)) * 1e6 / 60
 
+    # Extract pyruvate concentration
     pyr_match = re.search(r'(\d+[,.]?\d*)\s*mM', filename, re.IGNORECASE)
     pyr_val = float(pyr_match.group(1).replace(',', '.')) if pyr_match else 0.0
+
+    # Extract enzyme type based on "initials_enzymetype_concentration_runorder_date" convention
+    parts = filename.split('_')
+    enzyme_type = "Unknown"
+    if len(parts) > 1:
+        # Assuming enzyme type is the second part (index 1)
+        enzyme_type = parts[1].split('.')[0] # Remove file extension if present
+
+    # Convert to uppercase for consistency
+    enzyme_type = enzyme_type.upper()
 
     return {
         "filename": filename,
@@ -117,7 +128,8 @@ def calculate_kinetics(df, filename):
         "as_time": df.iloc[as_idx]['Time'],
         "ae_time": df.iloc[ae_idx]['Time'],
         "v0_data": v0_data,
-        "full_df": df
+        "full_df": df,
+        "enzyme_type": enzyme_type # Add enzyme type here
     }
 
 def michaelis_menten(S, Vmax, Km):
@@ -154,7 +166,8 @@ if files:
                 "File": r['filename'],
                 "Pyruvate (mM)": r['pyruvate'],
                 "V0 (µM/s)": round(r['v0_um_s'], 4),
-                "R²": round(r['r2'], 4)
+                "R²": round(r['r2'], 4),
+                "Enzyme Type": r['enzyme_type'] # Add enzyme type to summary_data
             })
 
         edited_df = st.data_editor(
@@ -166,6 +179,10 @@ if files:
                     "Pyruvate (mM)",
                     format="%.3f",
                     disabled=False
+                ),
+                "Enzyme Type": st.column_config.TextColumn(
+                    "Enzyme Type",
+                    disabled=False # Changed to False for editability
                 )
             }
         )
@@ -177,6 +194,8 @@ if files:
             for run in all_runs:
                 if run['filename'] == row['File']:
                     run['pyruvate'] = row['Pyruvate (mM)']
+                    # Update enzyme type as well
+                    run['enzyme_type'] = row['Enzyme Type']
                     break
 
         final_results = [r for r in all_runs if r['filename'] in included_filenames]
@@ -191,8 +210,8 @@ if files:
                     calc_table.append({
                         "Substrate [S]": f"{r['pyruvate']} mM",
                         "Slope (Abs/min)": round(r['slope_abs_min'], 6),
-                        "Step 1: (Slope / ε)": f"{r['slope_abs_min']/EPSILON:.2e} M/min",
-                        "Final V0": f"{r['v0_um_s']:.4f} µM/s"
+                        "Step 1: (Slope / \u03b5)": f"{r['slope_abs_min']/EPSILON:.2e} M/min",
+                        "Final V0": f"{r['v0_um_s']:.4f} \u00b5M/s"
                     })
                 st.table(calc_table)
 
@@ -212,7 +231,7 @@ if files:
                     ax2.scatter(r['v0_data']['Time'], r['v0_data']['Abs'], s=5, color='orange')
                     t = r['v0_data']['Time']
                     ax2.plot(t, r['slope_abs_min'] * t + r['intercept'], color='blue', lw=1)
-                    ax2.set_title(f"V0 Slope (R²={r['r2']:.4f})")
+                    ax2.set_title(f"V0 Slope (R²={r['r2']:.4f}, [S]={r['pyruvate']} mM, Enzyme: {r['enzyme_type']})") # Added pyruvate concentration and Enzyme Type
                     st.pyplot(fig)
 
             # 4. MICHAELIS-MENTEN FIT
@@ -222,6 +241,10 @@ if files:
 
                 s_vals = np.array([r['pyruvate'] for r in final_results])
                 v_vals = np.array([r['v0_um_s'] for r in final_results])
+                
+                # Get unique enzyme types for the MM plot text
+                unique_enzyme_types = sorted(list(set([r['enzyme_type'] for r in final_results])))
+                enzyme_types_str = "" if not unique_enzyme_types else f"\nEnzyme Type(s): {', '.join(unique_enzyme_types)}"
 
                 try:
                     popt, pcov = curve_fit(michaelis_menten, s_vals, v_vals, p0=[max(v_vals), 1.0])
@@ -232,17 +255,21 @@ if files:
                     km_err = perr[1]
 
                     col_res1, col_res2, col_res3 = st.columns(3)
-                    col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} \u00B1 {km_err:.3f} mM")
-                    col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} \u00B1 {vmax_err:.3f} \u00B5M/s")
+                    col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} ± {km_err:.3f} mM")
+                    col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} ± {vmax_err:.3f} µM/s")
 
+                    plot_text = f"Km = {km:.3f} ± {km_err:.3f} mM\nVmax = {vmax:.3f} ± {vmax_err:.3f} \u00B5M/s"
                     if ENZYME_CONCENTRATION > 0:
                         kcat = vmax / ENZYME_CONCENTRATION
                         # Error propagation for Kcat = Vmax / [E]
                         # Assuming enzyme concentration has negligible error compared to Vmax
                         kcat_err = kcat * (vmax_err / vmax)
-                        col_res3.metric("Kcat (Turnover Number)", f"{kcat:.3f} \u00B1 {kcat_err:.3f} s⁻¹")
+                        col_res3.metric("Kcat (Turnover Number)", f"{kcat:.3f} ± {kcat_err:.3f} s⁻¹")
+                        plot_text += f"\nKcat = {kcat:.3f} \u00B1 {kcat_err:.3f} s\u207b\u00b9"
                     else:
                         col_res3.metric("Kcat (Turnover Number)", "N/A (Enter enzyme conc.)")
+
+                    plot_text += enzyme_types_str # Add enzyme types to the plot text
 
                     fig_mm, ax_mm = plt.subplots(figsize=(6.8, 4.25))
                     s_plot = np.linspace(0, max(s_vals)*1.2, 100)
@@ -252,6 +279,10 @@ if files:
                     ax_mm.set_ylabel("Initial Velocity $V_0$ [µM/s]")
                     ax_mm.legend()
                     ax_mm.grid(True, which='both', linestyle='--', alpha=0.5)
+
+                    # Add text for Km, Vmax, Kcat
+                    ax_mm.text(0.95, 0.05, plot_text, transform=ax_mm.transAxes, fontsize=10, verticalalignment='bottom', horizontalalignment='right', bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.5))
+
                     st.pyplot(fig_mm)
 
                 except Exception as e:

@@ -1,25 +1,77 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import re
 from scipy.stats import linregress
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, least_squares
 from io import StringIO
 
+APP_VERSION = "v.2"
+APP_NAME = f"LDHA Michaelis-Menten Analyzer {APP_VERSION}"
+
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="LDHA Kinetics Analyzer", layout="wide")
+st.set_page_config(page_title=APP_NAME, layout="wide")
 
 # --- CONSTANTS & CONFIG ---
 st.sidebar.header("🔬 Assay Configuration")
-EPSILON = st.sidebar.number_input("Extinction Coefficient (ε) [M⁻¹ cm⁻¹]", value=6220, help="NADH at 340nm is typically 6220")
+EPSILON = st.sidebar.number_input(
+    "Extinction Coefficient (ε) [M⁻¹ cm⁻¹]",
+    value=6220.0,
+    help="NADH at 340 nm is typically 6220"
+)
 PATH_LENGTH = st.sidebar.number_input("Cuvette Path Length (cm)", value=1.0)
-ENZYME_CONCENTRATION = st.sidebar.number_input("Enzyme Concentration [µM] (optional for Kcat)", value=0.0, format="%.3f", help="Enter purified enzyme concentration in µM for Kcat calculation.")
+ENZYME_CONCENTRATION = st.sidebar.number_input(
+    "Enzyme Concentration [µM] (optional for Kcat)",
+    value=0.0,
+    format="%.3f",
+    help="Enter purified enzyme concentration in µM for Kcat calculation."
+)
 
-# --- CORE LOGIC FUNCTIONS (Refactored from Notebook) ---
+st.sidebar.subheader("Linear-region detection")
+MIN_TIME_TO_CONSIDER = st.sidebar.number_input(
+    "Ignore data before (min)",
+    value=0.33,
+    format="%.3f",
+    help="Data before this time is ignored when searching for the linear portion."
+)
+MIN_POINTS_BEFORE_BREAK = st.sidebar.number_input(
+    "Min points before breakpoint",
+    min_value=3,
+    value=6,
+    step=1
+)
+MIN_POINTS_AFTER_BREAK = st.sidebar.number_input(
+    "Min points after breakpoint",
+    min_value=5,
+    value=8,
+    step=1
+)
+MIN_R2_LINEAR = st.sidebar.number_input(
+    "Minimum R² for accepted linear window",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.995,
+    format="%.4f"
+)
+WINDOW_POINTS = st.sidebar.number_input(
+    "Linear window size (points)",
+    min_value=5,
+    value=12,
+    step=1,
+    help="Number of points used when testing for the earliest acceptable linear region after the breakpoint."
+)
+SLOPE_RELAXATION_FACTOR = st.sidebar.number_input(
+    "Max allowed post-break slope / pre-break slope magnitude",
+    min_value=0.01,
+    max_value=1.0,
+    value=0.70,
+    format="%.2f",
+    help="Post-breakpoint slope magnitude must be smaller than the initial steep slope by at least this factor."
+)
 
 def load_and_clean_csv(uploaded_file):
-    """Parses Streamlit's UploadedFile object into a clean DataFrame."""
     try:
         content = uploaded_file.getvalue().decode("utf-8")
         lines = content.splitlines()
@@ -29,118 +81,214 @@ def load_and_clean_csv(uploaded_file):
             if "Time (min)" in line:
                 start_idx = i
                 break
-        if start_idx == -1: return None
+        if start_idx == -1:
+            return None
 
         data_lines = [lines[start_idx]]
-        for line in lines[start_idx+1:]:
+        for line in lines[start_idx + 1:]:
             parts = line.split(',')
             if len(parts) >= 2:
                 try:
                     float(parts[0])
                     data_lines.append(line)
-                except ValueError: break
+                except ValueError:
+                    break
 
         df = pd.read_csv(StringIO("\n".join(data_lines)))
         df = df.iloc[:, [0, 1]]
         df.columns = ['Time', 'Abs']
-        return df.dropna().reset_index(drop=True)
+        df = df.dropna().reset_index(drop=True)
+        df = df.sort_values("Time").reset_index(drop=True)
+        return df
+
     except Exception as e:
         st.error(f"Error reading {uploaded_file.name}: {e}")
         return None
 
-def detect_as_ae(df):
-    """Identifies the start (AS) and plateau (AE) of the reaction."""
-    if len(df) < 60: return 0, len(df) - 1
-    abs_vals = df['Abs'].values
+def piecewise_linear_continuous(x, x0, y0, m1, m2):
+    return np.where(x < x0, y0 + m1 * (x - x0), y0 + m2 * (x - x0))
 
-    # Detect AS
-    initial_as_idx = 0
-    rolling_diff = pd.Series(abs_vals).rolling(window=15).mean().diff()
-    for i in range(15, len(rolling_diff) - 20):
-        if all(rolling_diff[i:i+10] < 0):
-            initial_as_idx = i - 15 + np.argmax(abs_vals[max(0, i-20):i+1])
-            break
+def fit_segmented_regression(x, y, min_pts_before=6, min_pts_after=8):
+    n = len(x)
+    if n < (min_pts_before + min_pts_after + 2):
+        return []
 
-    # Detect AE
-    initial_ae_idx = len(abs_vals) - 1
-    for i in range(initial_as_idx + 50, len(abs_vals) - 50):
-        window = abs_vals[i:i+50]
-        if np.std(window) < 0.0005 or (abs(window[-1] - window[0]) < 0.001):
-            initial_ae_idx = i
-            break
+    candidates = []
 
-    reaction_length = initial_ae_idx - initial_as_idx
-    ae_adjustment = int(0.20 * reaction_length)
-    return initial_as_idx, max(initial_as_idx + 59, initial_ae_idx - ae_adjustment)
+    for bp_idx in range(min_pts_before, n - min_pts_after):
+        x0_guess = x[bp_idx]
+        y0_guess = y[bp_idx]
+
+        left_reg = linregress(x[:bp_idx], y[:bp_idx])
+        right_reg = linregress(x[bp_idx:], y[bp_idx:])
+
+        p0 = [x0_guess, y0_guess, left_reg.slope, right_reg.slope]
+
+        lower = [x[min_pts_before], min(y) - abs(np.ptp(y)), -np.inf, -np.inf]
+        upper = [x[n - min_pts_after - 1], max(y) + abs(np.ptp(y)), np.inf, np.inf]
+
+        try:
+            res = least_squares(
+                lambda p: piecewise_linear_continuous(x, *p) - y,
+                x0=p0,
+                bounds=(lower, upper),
+                max_nfev=5000
+            )
+            x0, y0, m1, m2 = res.x
+            split_idx = np.searchsorted(x, x0)
+
+            if split_idx < min_pts_before or split_idx > n - min_pts_after:
+                continue
+
+            if abs(m2) >= abs(m1) * SLOPE_RELAXATION_FACTOR:
+                continue
+
+            y_fit = piecewise_linear_continuous(x, x0, y0, m1, m2)
+            sse = np.sum((y - y_fit) ** 2)
+
+            candidates.append({
+                "x0": x0,
+                "y0": y0,
+                "m1": m1,
+                "m2": m2,
+                "split_idx": split_idx,
+                "sse": sse
+            })
+
+        except Exception:
+            continue
+
+    return candidates
+
+def choose_earliest_linear_window_after_break(x, y, start_idx, window_points=12, min_r2=0.995):
+    n = len(x)
+
+    for i in range(start_idx, n - window_points + 1):
+        xw = x[i:i + window_points]
+        yw = y[i:i + window_points]
+
+        reg = linregress(xw, yw)
+
+        if reg.slope >= 0:
+            continue
+        if reg.rvalue**2 < min_r2:
+            continue
+
+        best_j = i + window_points
+        best_reg = reg
+
+        for j in range(i + window_points + 1, n + 1):
+            xext = x[i:j]
+            yext = y[i:j]
+            reg_ext = linregress(xext, yext)
+            if reg_ext.slope < 0 and reg_ext.rvalue**2 >= min_r2:
+                best_j = j
+                best_reg = reg_ext
+            else:
+                break
+
+        return {
+            "start_idx": i,
+            "end_idx": best_j,
+            "reg": best_reg,
+            "r2": best_reg.rvalue**2,
+            "slope": best_reg.slope
+        }
+
+    return None
 
 def calculate_kinetics(df, filename):
-    """Calculates V0 using the 5-chunk minimum variance method."""
-    as_idx, ae_idx = detect_as_ae(df)
-    subset = df.iloc[as_idx:ae_idx+1].copy().reset_index(drop=True)
-    N = len(subset)
+    df_fit = df[df["Time"] >= MIN_TIME_TO_CONSIDER].copy().reset_index(drop=True)
 
-    chunk_size = max(15, int(np.round(0.025 * N)))
-    step_size = max(5, int(np.round(0.020 * N)))
-
-    chunks = []
-    i = 0
-    while i + chunk_size <= N:
-        chunk_df = subset.iloc[i : i + chunk_size]
-        reg = linregress(chunk_df['Time'], chunk_df['Abs'])
-        chunks.append({'slope': reg.slope, 'start': i, 'end': i + chunk_size, 'r_val': reg.rvalue})
-        i += step_size
-
-    if len(chunks) < 5:
-        final_reg = linregress(subset['Time'], subset['Abs'])
-        v0_data = subset
+    if len(df_fit) < (MIN_POINTS_BEFORE_BREAK + MIN_POINTS_AFTER_BREAK + 2):
+        reg = linregress(df_fit["Time"], df_fit["Abs"])
+        v0_data = df_fit.copy()
+        breakpoint_time = df_fit["Time"].iloc[0]
+        segmented_fit = None
+        selected_window = None
     else:
-        variances = [np.var([c['slope'] for c in chunks[j:j+5]]) for j in range(len(chunks)-4)]
-        best_start = np.argmin(variances)
-        v0_data = subset.iloc[chunks[best_start]['start'] : chunks[best_start+4]['end']]
-        final_reg = linregress(v0_data['Time'], v0_data['Abs'])
+        x = df_fit["Time"].to_numpy()
+        y = df_fit["Abs"].to_numpy()
 
-    # Units: (ΔAbs/min) -> (M/min) -> (µM/s)
-    # V = (Slope / (ε * l)) * 10^6 / 60
-    abs_slope = abs(final_reg.slope)
-    v0_um_s = (abs_slope / (EPSILON * PATH_LENGTH)) * 1e6 / 60
+        candidates = fit_segmented_regression(
+            x, y,
+            min_pts_before=MIN_POINTS_BEFORE_BREAK,
+            min_pts_after=MIN_POINTS_AFTER_BREAK
+        )
 
-    # Extract pyruvate concentration
+        if candidates:
+            best_sse = min(c["sse"] for c in candidates)
+            near_best = [c for c in candidates if c["sse"] <= best_sse * 1.05]
+            segmented_fit = min(near_best, key=lambda c: c["split_idx"])
+            breakpoint_idx = segmented_fit["split_idx"]
+            breakpoint_time = segmented_fit["x0"]
+        else:
+            segmented_fit = None
+            breakpoint_idx = 0
+            breakpoint_time = df_fit["Time"].iloc[0]
+
+        selected_window = choose_earliest_linear_window_after_break(
+            x, y,
+            start_idx=breakpoint_idx,
+            window_points=WINDOW_POINTS,
+            min_r2=MIN_R2_LINEAR
+        )
+
+        if selected_window is not None:
+            i0 = selected_window["start_idx"]
+            i1 = selected_window["end_idx"]
+            v0_data = df_fit.iloc[i0:i1].copy().reset_index(drop=True)
+            reg = selected_window["reg"]
+        else:
+            v0_data = df_fit.iloc[breakpoint_idx:].copy().reset_index(drop=True)
+            reg = linregress(v0_data["Time"], v0_data["Abs"])
+
+    abs_slope = abs(reg.slope)
+    v0_um_s = (abs_slope / (EPSILON * PATH_LENGTH)) * 1e6 / 60.0
+
     pyr_match = re.search(r'(\d+[,.]?\d*)\s*mM', filename, re.IGNORECASE)
     pyr_val = float(pyr_match.group(1).replace(',', '.')) if pyr_match else 0.0
 
-    # Extract enzyme type based on "initials_enzymetype_concentration_runorder_date" convention
-    parts = filename.split('_')
-    enzyme_type = "Unknown"
-    if len(parts) > 1:
-        # Assuming enzyme type is the second part (index 1)
-        enzyme_type = parts[1].split('.')[0] # Remove file extension if present
-
-    # Convert to uppercase for consistency
-    enzyme_type = enzyme_type.upper()
+    enzyme_match = re.search(r'(E\d+[A-Z]|Mutant[A-Z0-9]*|WT)_LDHA', filename, re.IGNORECASE)
+    if not enzyme_match:
+        enzyme_match = re.search(r'^(E\d+[A-Z]|Mutant[A-Z0-9]*|WT)', filename, re.IGNORECASE)
+    enzyme_type = enzyme_match.group(1).upper() if enzyme_match else "Unknown"
 
     return {
         "filename": filename,
         "pyruvate": pyr_val,
         "v0_um_s": v0_um_s,
-        "slope_abs_min": final_reg.slope,
-        "intercept": final_reg.intercept,
-        "r2": final_reg.rvalue**2,
-        "as_time": df.iloc[as_idx]['Time'],
-        "ae_time": df.iloc[ae_idx]['Time'],
+        "slope_abs_min": reg.slope,
+        "intercept": reg.intercept,
+        "r2": reg.rvalue ** 2,
+        "breakpoint_time": breakpoint_time,
+        "fit_start_time": float(df_fit["Time"].iloc[0]) if len(df_fit) else np.nan,
         "v0_data": v0_data,
         "full_df": df,
-        "enzyme_type": enzyme_type # Add enzyme type here
+        "fit_df": df_fit,
+        "enzyme_type": enzyme_type,
+        "segmented_fit": segmented_fit,
+        "selected_window": selected_window
     }
 
 def michaelis_menten(S, Vmax, Km):
     return (Vmax * S) / (Km + S)
 
-# --- UI APP START ---
-
-st.title("🧪 LDHA Michaelis-Menten Analyzer")
+st.title(f"🧪 {APP_NAME}")
 st.markdown("""
 Upload your kinetic CSV files. The app will automatically calculate the initial velocity ($V_0$)
-from the steadiest part of each curve and fit the data to the Michaelis-Menten equation.
+from the linear portion of each curve using a segmented-regression-based method designed to skip
+the initial steep slope caused by substrate addition.
+""")
+
+with st.expander(f"📜 Change Log ({APP_VERSION})", expanded=False):
+    st.markdown("""
+**Changes from the previous version**
+- Added versioned app title.
+- Added a Change Log drop-down menu.
+- Improved detection of the initial steep negative slope caused by substrate addition.
+- Required the pre-breakpoint slope to be steeper than the later slope.
+- After finding the breakpoint, the code now tests the earliest acceptable linear window.
 """)
 
 files = st.file_uploader("Upload CSV Files", accept_multiple_files=True)
@@ -154,20 +302,19 @@ if files:
             all_runs.append(res)
 
     if all_runs:
-        # 1. OUTLIER SELECTION TABLE
         st.subheader("📊 Results Summary & Outlier Selection")
         st.info("Uncheck the 'Include' box to exclude a run from the Michaelis-Menten fit.")
 
-        # Build dataframe for editor
         summary_data = []
         for r in all_runs:
             summary_data.append({
                 "Include": True,
                 "File": r['filename'],
+                "Enzyme Type": r['enzyme_type'],
                 "Pyruvate (mM)": r['pyruvate'],
                 "V0 (µM/s)": round(r['v0_um_s'], 4),
                 "R²": round(r['r2'], 4),
-                "Enzyme Type": r['enzyme_type'] # Add enzyme type to summary_data
+                "Breakpoint (min)": round(r['breakpoint_time'], 4) if pd.notnull(r['breakpoint_time']) else np.nan
             })
 
         edited_df = st.data_editor(
@@ -175,34 +322,23 @@ if files:
             hide_index=True,
             use_container_width=True,
             column_config={
-                "Pyruvate (mM)": st.column_config.NumberColumn(
-                    "Pyruvate (mM)",
-                    format="%.3f",
-                    disabled=False
-                ),
-                "Enzyme Type": st.column_config.TextColumn(
-                    "Enzyme Type",
-                    disabled=False # Changed to False for editability
-                )
+                "Pyruvate (mM)": st.column_config.NumberColumn("Pyruvate (mM)", format="%.3f", disabled=False),
+                "Enzyme Type": st.column_config.TextColumn("Enzyme Type", disabled=True),
+                "Breakpoint (min)": st.column_config.NumberColumn("Breakpoint (min)", format="%.4f", disabled=True)
             }
         )
 
-        # Filter included runs
         included_filenames = edited_df[edited_df["Include"] == True]["File"].tolist()
-        # Update pyruvate concentrations based on edited_df for included runs
-        for i, row in edited_df.iterrows():
+
+        for _, row in edited_df.iterrows():
             for run in all_runs:
                 if run['filename'] == row['File']:
                     run['pyruvate'] = row['Pyruvate (mM)']
-                    # Update enzyme type as well
-                    run['enzyme_type'] = row['Enzyme Type']
                     break
 
         final_results = [r for r in all_runs if r['filename'] in included_filenames]
 
-        # Add a button to trigger MM calculation
         if st.button("Calculate Michaelis-Menten Kinetics"):
-            # 2. CALCULATIONS BREAKDOWN
             with st.expander("📝 View Detailed Calculations"):
                 st.latex(r"V_0 (\mu M/s) = \frac{|\Delta Abs/min|}{\epsilon \cdot l} \cdot \frac{10^6}{60}")
                 calc_table = []
@@ -210,97 +346,108 @@ if files:
                     calc_table.append({
                         "Substrate [S]": f"{r['pyruvate']} mM",
                         "Slope (Abs/min)": round(r['slope_abs_min'], 6),
-                        "Step 1: (Slope / \u03b5)": f"{r['slope_abs_min']/EPSILON:.2e} M/min",
-                        "Final V0": f"{r['v0_um_s']:.4f} \u00b5M/s"
+                        "Step 1: (Slope / ε)": f"{r['slope_abs_min']/EPSILON:.2e} M/min",
+                        "Final V0": f"{r['v0_um_s']:.4f} µM/s",
+                        "Breakpoint": f"{r['breakpoint_time']:.4f} min"
                     })
                 st.table(calc_table)
 
-            # 3. INDIVIDUAL V0 PLOTS
             st.divider()
             st.subheader("📈 Individual Run Fits")
             cols = st.columns(2)
+
             for idx, r in enumerate(all_runs):
                 with cols[idx % 2].expander(f"Run: {r['pyruvate']} mM Pyruvate ({r['filename']})", expanded=False):
-                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.5))
-                    # Plot 1: Full
-                    ax1.plot(r['full_df']['Time'], r['full_df']['Abs'], color='gray', alpha=0.5)
-                    ax1.axvline(r['as_time'], color='g', linestyle='--', label='Start')
-                    ax1.axvline(r['ae_time'], color='r', linestyle='--', label='End')
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 3.8))
+
+                    ax1.plot(r['full_df']['Time'], r['full_df']['Abs'], color='gray', alpha=0.7, label='Full trace')
+                    ax1.axvline(MIN_TIME_TO_CONSIDER, color='purple', linestyle='--', label='Min time')
+                    ax1.axvline(r['breakpoint_time'], color='red', linestyle='--', label='Breakpoint')
                     ax1.set_title("Full Assay")
-                    # Plot 2: Fit
-                    ax2.scatter(r['v0_data']['Time'], r['v0_data']['Abs'], s=5, color='orange')
+                    ax1.set_xlabel("Time (min)")
+                    ax1.set_ylabel("Abs")
+                    ax1.legend()
+
+                    fit_df = r['fit_df']
+                    ax2.scatter(fit_df['Time'], fit_df['Abs'], s=10, color='lightgray', label='Eligible data')
+
+                    if r['segmented_fit'] is not None:
+                        seg = r['segmented_fit']
+                        xfit = fit_df['Time'].to_numpy()
+                        yfit = piecewise_linear_continuous(xfit, seg["x0"], seg["y0"], seg["m1"], seg["m2"])
+                        ax2.plot(xfit, yfit, color='green', lw=1.5, label='Segmented fit')
+
+                    ax2.scatter(r['v0_data']['Time'], r['v0_data']['Abs'], s=18, color='orange', label='Selected linear region')
                     t = r['v0_data']['Time']
-                    ax2.plot(t, r['slope_abs_min'] * t + r['intercept'], color='blue', lw=1)
-                    
-                    # Individual V0 Plot text
-                    v0_plot_text = (
-                        f"R² = {r['r2']:.4f}\n"
-                        f"V0 = {r['v0_um_s']:.4f} µM/s\n"
-                        f"[S] = {r['pyruvate']} mM\n"
-                        f"Enzyme: {r['enzyme_type']}"
-                    )
-                    ax2.text(0.95, 0.95, v0_plot_text, transform=ax2.transAxes, fontsize=8, 
-                             verticalalignment='top', horizontalalignment='right', 
-                             bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.5))
-                    ax2.set_title("V0 Fit")
+                    ax2.plot(t, r['slope_abs_min'] * t + r['intercept'], color='blue', lw=1.5, label='Final linear fit')
+                    ax2.axvline(r['breakpoint_time'], color='red', linestyle='--')
+
+                    ax2.set_title(f"V0 Fit (R²={r['r2']:.4f}, [S]={r['pyruvate']} mM)")
+                    ax2.set_xlabel("Time (min)")
+                    ax2.set_ylabel("Abs")
+                    ax2.legend()
+
                     st.pyplot(fig)
 
-            # 4. MICHAELIS-MENTEN FIT
             if len(final_results) >= 3:
                 st.divider()
                 st.subheader("🧪 Michaelis-Menten Kinetic Fit")
 
-                s_vals = np.array([r['pyruvate'] for r in final_results])
-                v_vals = np.array([r['v0_um_s'] for r in final_results])
-                
-                # Get unique enzyme types for the MM plot text
-                unique_enzyme_types = sorted(list(set([r['enzyme_type'] for r in final_results])))
-                enzyme_types_str = "" if not unique_enzyme_types else f"\nEnzyme Type(s): {', '.join(unique_enzyme_types)}"
+                s_vals = np.array([r['pyruvate'] for r in final_results], dtype=float)
+                v_vals = np.array([r['v0_um_s'] for r in final_results], dtype=float)
 
                 try:
-                    popt, pcov = curve_fit(michaelis_menten, s_vals, v_vals, p0=[max(v_vals), 1.0])
+                    popt, pcov = curve_fit(
+                        michaelis_menten,
+                        s_vals,
+                        v_vals,
+                        p0=[max(v_vals), np.median(s_vals[s_vals > 0]) if np.any(s_vals > 0) else 1.0],
+                        maxfev=10000
+                    )
                     vmax, km = popt
                     perr = np.sqrt(np.diag(pcov))
-
                     vmax_err = perr[0]
                     km_err = perr[1]
 
                     col_res1, col_res2, col_res3 = st.columns(3)
                     col_res1.metric("Km (Michaelis Constant)", f"{km:.3f} ± {km_err:.3f} mM")
-                    col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} ± {vmax_err:.3f} \u00B5M/s")
+                    col_res2.metric("Vmax (Max Velocity)", f"{vmax:.3f} ± {vmax_err:.3f} µM/s")
 
-                    plot_text = f"Km = {km:.3f} ± {km_err:.3f} mM\nVmax = {vmax:.3f} ± {vmax_err:.3f} \u00B5M/s"
+                    plot_text = f"Km = {km:.3f} ± {km_err:.3f} mM\nVmax = {vmax:.3f} ± {vmax_err:.3f} µM/s"
+
                     if ENZYME_CONCENTRATION > 0:
                         kcat = vmax / ENZYME_CONCENTRATION
-                        # Error propagation for Kcat = Vmax / [E]
-                        # Assuming enzyme concentration has negligible error compared to Vmax
-                        kcat_err = kcat * (vmax_err / vmax)
+                        kcat_err = kcat * (vmax_err / vmax) if vmax != 0 else np.nan
                         col_res3.metric("Kcat (Turnover Number)", f"{kcat:.3f} ± {kcat_err:.3f} s⁻¹")
-                        plot_text += f"\nKcat = {kcat:.3f} \u00B1 {kcat_err:.3f} s\u207b\u00b9"
+                        plot_text += f"\nKcat = {kcat:.3f} ± {kcat_err:.3f} s⁻¹"
                     else:
                         col_res3.metric("Kcat (Turnover Number)", "N/A (Enter enzyme conc.)")
 
-                    plot_text += enzyme_types_str # Add enzyme types to the plot text
-
                     fig_mm, ax_mm = plt.subplots(figsize=(6.8, 4.25))
-                    s_plot = np.linspace(0, max(s_vals)*1.2, 100)
+                    s_plot = np.linspace(0, max(s_vals) * 1.2 if len(s_vals) else 1, 200)
+
                     ax_mm.scatter(s_vals, v_vals, color='red', label='Experimental Data', zorder=5)
-                    ax_mm.plot(s_plot, michaelis_menten(s_plot, *popt), label=f'MM Fit ($K_m$={km:.2f})', color='black')
+                    ax_mm.plot(s_plot, michaelis_menten(s_plot, *popt), color='black', label=f'MM Fit ($K_m$={km:.2f})')
                     ax_mm.set_xlabel("Pyruvate Concentration [mM]")
                     ax_mm.set_ylabel("Initial Velocity $V_0$ [µM/s]")
                     ax_mm.legend()
                     ax_mm.grid(True, which='both', linestyle='--', alpha=0.5)
 
-                    # Add text for Km, Vmax, Kcat
-                    ax_mm.text(0.95, 0.05, plot_text, transform=ax_mm.transAxes, fontsize=10, verticalalignment='bottom', horizontalalignment='right', bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.5))
+                    ax_mm.text(
+                        0.95, 0.05, plot_text,
+                        transform=ax_mm.transAxes,
+                        fontsize=10,
+                        verticalalignment='bottom',
+                        horizontalalignment='right',
+                        bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.5)
+                    )
 
                     st.pyplot(fig_mm)
 
                 except Exception as e:
-                    st.error(f"Could not fit Michaelis-Menten curve. Ensure you have enough data points. Error: {e}")
+                    st.error(f"Could not fit Michaelis-Menten curve. Error: {e}")
             else:
                 st.warning("Please include at least 3 runs to perform Michaelis-Menten fitting.")
-
 else:
     st.write("---")
     st.info("☝️ Please upload some CSV files to begin.")

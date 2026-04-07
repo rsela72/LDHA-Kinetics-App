@@ -371,12 +371,18 @@ if files:
             if st.session_state.mm_plot_ready:
                 final_results_mm_fit = st.session_state.v0_calculated_results # Data for MM fit
 
-                if len(final_results_mm_fit) >= 3:
-                    st.divider()
-                    st.subheader("🧪 Michaelis-Menten Kinetic Fit")
+                if len(final_results_mm_fit) >= 2: # At least 2 points required, 0,0 adds one more
 
-                    s_vals = np.array([r['pyruvate'] for r in final_results_mm_fit])
-                    v_vals = np.array([r['v0_um_s'] for r in final_results_mm_fit])
+                    s_vals_list = [r['pyruvate'] for r in final_results_mm_fit]
+                    v_vals_list = [r['v0_um_s'] for r in final_results_mm_fit]
+
+                    # Add (0,0) point if not already present
+                    if 0 not in s_vals_list:
+                        s_vals_list.append(0.0)
+                        v_vals_list.append(0.0)
+
+                    s_vals = np.array(s_vals_list)
+                    v_vals = np.array(v_vals_list)
 
                     # Get unique enzyme types for the MM plot text
                     unique_enzyme_types = sorted(list(set([r['enzyme_type'] for r in final_results_mm_fit])))
@@ -540,7 +546,7 @@ if files:
                         st.error(f"Could not fit Michaelis-Menten curve. Ensure you have enough data points. Error: {e}")
                         print(f"Michaelis-Menten curve fit error: {e}") # Print the exception for debugging
                 else:
-                    st.warning("Please include at least 3 runs to perform Michaelis-Menten fitting.")
+                    st.warning("Please include at least 2 runs (plus the implicit 0,0 point) to perform Michaelis-Menten fitting.")
 
 else:
     # If no files are uploaded, clear session state related to runs

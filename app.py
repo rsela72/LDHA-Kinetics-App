@@ -21,42 +21,31 @@ NUM_CHUNKS_FOR_VARIANCE = st.sidebar.number_input("Number of continuous chunks f
 # --- CORE LOGIC FUNCTIONS (Refactored from Notebook) ---
 
 def load_and_clean_csv(uploaded_file):
-    """Parse instrument-export CSV/text into a clean Time/Abs DataFrame."""
+    """Parses Streamlit's UploadedFile object into a clean DataFrame."""
     try:
-        raw = uploaded_file.getvalue()
+        content = uploaded_file.getvalue().decode("utf-8")
+        lines = content.splitlines()
 
-        try:
-            content = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            content = raw.decode("latin-1")
+        start_idx = -1
+        for i, line in enumerate(lines):
+            if "Time (min)" in line:
+                start_idx = i
+                break
+        if start_idx == -1: return None
 
-        # Normalize whitespace a bit
-        content = content.replace('\r', '\n')
+        data_lines = [lines[start_idx]]
+        for line in lines[start_idx+1:]:
+            parts = line.split(',')
+            if len(parts) >= 2:
+                try:
+                    float(parts[0])
+                    data_lines.append(line)
+                except ValueError: break
 
-        # Look for start of numeric data after a Time header
-        if "Time (min)" in content:
-            start_text = content.split("Time (min)", 1)[1]
-        elif "Time minAbs" in content:
-            start_text = content.split("Time minAbs", 1)[1]
-        else:
-            st.error(f"Could not find a recognizable time/abs header in {uploaded_file.name}")
-            return None
-
-        # Extract repeated pairs: time followed by absorbance
-        # Example pair: 0.0008333333535 0.6457306147
-        matches = re.findall(r'(\d+\.\d+)\s*([+-]?\d+\.\d+)', start_text)
-
-        if not matches:
-            st.error(f"No numeric Time/Abs pairs found in {uploaded_file.name}")
-            return None
-
-        df = pd.DataFrame(matches, columns=["Time", "Abs"]).astype(float)
-
-        # Optional cleanup: keep only realistic assay rows
-        df = df[(df["Time"] >= 0) & (df["Abs"] >= 0)].reset_index(drop=True)
-
-        return df
-
+        df = pd.read_csv(StringIO("\n".join(data_lines)))
+        df = df.iloc[:, [0, 1]]
+        df.columns = ['Time', 'Abs']
+        return df.dropna().reset_index(drop=True)
     except Exception as e:
         st.error(f"Error reading {uploaded_file.name}: {e}")
         return None

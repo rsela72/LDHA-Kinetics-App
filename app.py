@@ -28,7 +28,7 @@ def load_and_clean_csv(uploaded_file):
 
         start_idx = -1
         for i, line in enumerate(lines):
-            if "Time (min)" in line:
+            if "Time (sec)" in line:
                 start_idx = i
                 break
         if start_idx == -1: return None
@@ -114,9 +114,9 @@ def calculate_kinetics(df, filename, user_as_time=None, user_ae_time=None):
         final_reg = linregress(v0_data['Time'], v0_data['Abs'])
 
     # Units: (ΔAbs/min) -> (M/min) -> (µM/s)
-    # V = (Slope / (ε * l)) * 10^6 / 60
+    # V = (Slope / (ε * l)) * 10^6
     abs_slope = abs(final_reg.slope)
-    v0_um_s = (abs_slope / (EPSILON * PATH_LENGTH)) * 1e6 / 60
+    v0_um_s = (abs_slope / (EPSILON * PATH_LENGTH)) * 1e6
 
     # Extract pyruvate concentration
     pyr_match = re.search(r'(\d+[,.]?\d*)\s*mM', filename, re.IGNORECASE)

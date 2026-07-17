@@ -330,38 +330,103 @@ if files:
                     })
                 st.table(calc_table)
 
-            # 3. INDIVIDUAL V0 PLOTS
-            st.divider()
-            st.subheader("📈 Individual Run Fits")
-            cols = st.columns(2)
-            for idx, r_to_plot in enumerate(st.session_state.all_runs): # Iterate through session_state.all_runs for plotting
-                # Ensure only included files with recalculated V0 are plotted or handle others gracefully
-                if r_to_plot['filename'] in included_filenames: # Use included_filenames from data_editor
-                    with cols[idx % 2].expander(f"Run: {r_to_plot['pyruvate']} mM Pyruvate ({r_to_plot['filename']})", expanded=False):
+           # 3. INDIVIDUAL V0 PLOTS
+st.divider()
+st.subheader("📈 Individual Run Fits")
+cols = st.columns(2)
 
-                        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.5))
-                        # Plot 1: Full
-                        ax1.plot(r_to_plot['full_df']['Time'], r_to_plot['full_df']['Abs'], color='gray', alpha=0.5)
-                        ax1.axvline(r_to_plot['as_time'], color='g', linestyle='--', label='Start')
-                        ax1.axvline(r_to_plot['ae_time'], color='r', linestyle='--', label='End')
-                        ax1.set_title("Full Assay")
-                        # Plot 2: Fit
-                        ax2.scatter(r_to_plot['v0_data']['Time'], r_to_plot['v0_data']['Abs'], s=5, color='orange')
-                        t = r_to_plot['v0_data']['Time']
-                        ax2.plot(t, r_to_plot['slope_abs_min'] * t + r_to_plot['intercept'], color='blue', lw=1)
+for idx, r_to_plot in enumerate(st.session_state.all_runs):
+    # Plot only the runs currently included in the analysis
+    if r_to_plot['filename'] in included_filenames:
+        with cols[idx % 2].expander(
+            f"Run: {r_to_plot['pyruvate']} mM Pyruvate ({r_to_plot['filename']})",
+            expanded=False
+        ):
 
-                        # Individual V0 Plot text
-                        v0_plot_text = (
-                            f"R² = {r_to_plot['r2']:.4f}\n"
-                            f"V0 = {r_to_plot['v0_um_s']:.4f} \u00b5M/s\n"
-                            f"[S] = {r_to_plot['pyruvate']} mM\n"
-                            f"Enzyme: {r_to_plot['enzyme_type']}"
-                        )
-                        ax2.text(0.95, 0.95, v0_plot_text, transform=ax2.transAxes, fontsize=8,
-                                 verticalalignment='top', horizontalalignment='right',
-                                 bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.5))
-                        ax2.set_title("V0 Fit")
-                        st.pyplot(fig)
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.5))
+
+            # Convert stored minutes to seconds FOR DISPLAY ONLY.
+            # Do not change the original Time column or V0 calculations.
+            full_time_s = r_to_plot['full_df']['Time'] * 60
+            v0_time_s = r_to_plot['v0_data']['Time'] * 60
+            as_time_s = r_to_plot['as_time'] * 60
+            ae_time_s = r_to_plot['ae_time'] * 60
+
+            # --- Plot 1: Full assay ---
+            ax1.plot(
+                full_time_s,
+                r_to_plot['full_df']['Abs'],
+                color='gray',
+                alpha=0.5
+            )
+            ax1.axvline(as_time_s, color='g', linestyle='--', label='Start')
+            ax1.axvline(ae_time_s, color='r', linestyle='--', label='End')
+
+            ax1.set_title("Full Assay")
+            ax1.set_xlabel("Time (s)")
+            ax1.set_ylabel("Absorbance")
+            ax1.grid(
+                True,
+                which='major',
+                linestyle='--',
+                linewidth=0.5,
+                alpha=0.35
+            )
+            ax1.set_axisbelow(True)
+            ax1.legend(fontsize=8)
+
+            # --- Plot 2: V0 fit ---
+            ax2.scatter(
+                v0_time_s,
+                r_to_plot['v0_data']['Abs'],
+                s=5,
+                color='orange'
+            )
+
+            # Stored slope is Abs/min. Divide by 60 to get Abs/s,
+            # matching the x-axis now displayed in seconds.
+            slope_abs_s = r_to_plot['slope_abs_min'] / 60
+
+            ax2.plot(
+                v0_time_s,
+                slope_abs_s * v0_time_s + r_to_plot['intercept'],
+                color='blue',
+                lw=1
+            )
+
+            v0_plot_text = (
+                f"R² = {r_to_plot['r2']:.4f}\n"
+                f"V0 = {r_to_plot['v0_um_s']:.4f} µM/s\n"
+                f"[S] = {r_to_plot['pyruvate']} mM\n"
+                f"Enzyme: {r_to_plot['enzyme_type']}"
+            )
+
+            ax2.text(
+                0.95,
+                0.95,
+                v0_plot_text,
+                transform=ax2.transAxes,
+                fontsize=8,
+                verticalalignment='top',
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.5)
+            )
+
+            ax2.set_title("V0 Fit")
+            ax2.set_xlabel("Time (s)")
+            ax2.set_ylabel("Absorbance")
+            ax2.grid(
+                True,
+                which='major',
+                linestyle='--',
+                linewidth=0.5,
+                alpha=0.35
+            )
+            ax2.set_axisbelow(True)
+
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
 
             # Button to initiate MM Plotting
             if st.button("Initiate MM Plot"):

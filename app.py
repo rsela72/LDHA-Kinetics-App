@@ -17,6 +17,8 @@ if "config_num_chunks" not in st.session_state: st.session_state.config_num_chun
 # --- CONSTANTS & CONFIG ---
 st.sidebar.header("🔬 Assay Configuration")
 EPSILON = st.sidebar.number_input("Extinction Coefficient (ε) [M⁻¹ cm⁻¹]", value=6220, help="NADH at 340nm is typically 6220")
+EPSILON_PYRUVATE = 10
+NADH_CONC = 0.000075
 PATH_LENGTH = st.sidebar.number_input("Cuvette Path Length (cm)", value=1.0)
 ENZYME_CONCENTRATION = st.sidebar.number_input("Enzyme Concentration [µM] (optional for Kcat)", value=0.0, format="%.3f", help="Enter purified enzyme concentration in µM for Kcat calculation.")
 NUM_CHUNKS_FOR_VARIANCE = st.sidebar.number_input("Number of continuous chunks for V0 detection", value=8, min_value=3, help="Increase to make V0 detection more stringent over a longer linear phase. Default is 8.")
@@ -78,76 +80,105 @@ def detect_as_ae(df):
     return initial_as_idx, max(initial_as_idx + 59, initial_ae_idx - ae_adjustment)
 
 def calculate_kinetics(df, filename, user_as_time=None, user_ae_time=None):
-    """Calculates V0 using the 5-chunk minimum variance method, with optional user-defined AS/AE times."""
-    if user_as_time is not None and user_ae_time is not None:
-        # Find closest indices for user-defined times
-        as_idx = df['Time'].sub(user_as_time).abs().idxmin()
-        ae_idx = df['Time'].sub(user_ae_time).abs().idxmin()
-    else:
-        as_idx, ae_idx = detect_as_ae(df)
+    from scipy.stats import linregress
+    import re
+    
+    # 1. Safely grab column names (assumes column 1 is Time, column 2 is Absorbance)
+    time_col = df.columns[0]
+    abs_col = df.columns[1]
 
-    # Ensure as_idx is before ae_idx and within bounds
-    if as_idx >= ae_idx: # If user input causes this, fallback to automatic detection
-        as_idx, ae_idx = detect_as_ae(df)
-    elif as_idx < 0: as_idx = 0
-    elif ae_idx >= len(df): ae_idx = len(df) - 1
-
-    subset = df.iloc[as_idx:ae_idx+1].copy().reset_index(drop=True)
-    N = len(subset)
-
-    chunk_size = max(15, int(np.round(0.025 * N)))
-    step_size = max(5, int(np.round(0.020 * N)))
-
-    chunks = []
-    i = 0
-    while i + chunk_size <= N:
-        chunk_df = subset.iloc[i : i + chunk_size]
-        reg = linregress(chunk_df['Time'], chunk_df['Abs'])
-        chunks.append({'slope': reg.slope, 'start': i, 'end': i + chunk_size, 'r_val': reg.rvalue})
-        i += step_size
-
-    if len(chunks) < NUM_CHUNKS_FOR_VARIANCE:
-        final_reg = linregress(subset['Time'], subset['Abs'])
-        v0_data = subset
-    else:
-        # Use NUM_CHUNKS_FOR_VARIANCE here
-        variances = [np.var([c['slope'] for c in chunks[j:j+int(NUM_CHUNKS_FOR_VARIANCE)]]) for j in range(len(chunks)-int(NUM_CHUNKS_FOR_VARIANCE)+1)]
-        best_start = np.argmin(variances)
-        v0_data = subset.iloc[chunks[best_start]['start'] : chunks[best_start+int(NUM_CHUNKS_FOR_VARIANCE)-1]['end']]
-        final_reg = linregress(v0_data['Time'], v0_data['Abs'])
-
-    # Units: (ΔAbs/min) -> (M/min) -> (µM/s)
-    # V = (Slope / (ε * l)) * 10^6 / 60
-    abs_slope = abs(final_reg.slope)
-    v0_um_s = (abs_slope / (EPSILON * PATH_LENGTH)) * 1e6
-
-    # Extract pyruvate concentration
+    # 2. Parse filename for Pyruvate concentration (e.g., "1.5mM")
     pyr_match = re.search(r'(\d+[,.]?\d*)\s*mM', filename, re.IGNORECASE)
-    pyr_val = float(pyr_match.group(1).replace(',', '.')) if pyr_match else 0.0
-
-    # Extract enzyme type based on "initials_enzymetype_concentration_runorder_date" convention
-    parts = filename.split('_')
+    pyruvate_val = float(pyr_match.group(1).replace(',', '.')) if pyr_match else 0.0
+    
+    # Guess Enzyme Type from filename (fallback to Unknown)
     enzyme_type = "Unknown"
-    if len(parts) > 1:
-        # Assuming enzyme type is the second part (index 1)
-        enzyme_type = parts[1].split('.')[0] # Remove file extension if present
+    if "LDHA" in filename.upper(): enzyme_type = "LDHA"
+    elif "LDHB" in filename.upper(): enzyme_type = "LDHB"
 
-    # Convert to uppercase for consistency
-    enzyme_type = enzyme_type.upper()
+    # --- 3. AUTO-CALCULATE AS & AE ---
+# --- 3. AUTO-CALCULATE AS & AE ---
+# --- 3. AUTO-CALCULATE AS & AE ---
+    if pd.isna(user_as_time) or pd.isna(user_ae_time) or user_as_time is None or user_ae_time is None:
+        
+        # 1. Calculate the strict theoretical top using ONLY the equation
+        abs_nadh = EPSILON * NADH_CONC * PATH_LENGTH
+        pyruvate_molar = pyruvate_val / 1000.0
+        abs_pyruvate = EPSILON_PYRUVATE * pyruvate_molar * PATH_LENGTH
+        
+        theoretical_top = abs_nadh + abs_pyruvate
+        
+        # 2. Check for a spike
+        global_max = df[abs_col].max()
+        global_max_idx = df[abs_col].idxmax()
+        first_data_point = df[abs_col].iloc[0]
+        
+        # Condition A: If it spikes UP higher than the very first data point
+        # (Using a small 0.02 buffer so regular machine noise doesn't trigger it)
+        if global_max > (first_data_point + 0.02):
+            as_idx = global_max_idx
+            
+        # Condition B: If it only goes down, start exactly at the theoretical top
+        else:
+            start_points = df[df[abs_col] <= theoretical_top]
+            if not start_points.empty:
+                as_idx = start_points.index[0]
+            else:
+                as_idx = 0 
+                
+        auto_as_time = df[time_col].loc[as_idx]
+        
+        # 3. Find AE: Exactly 80% of the theoretical top
+        start_abs = df[abs_col].loc[as_idx]
+        target_y = 0.8 * start_abs
+        
+        post_as_df = df.loc[as_idx:]
+        ae_drop_points = post_as_df[post_as_df[abs_col] <= target_y]
+        
+        if not ae_drop_points.empty:
+            auto_ae_time = ae_drop_points[time_col].iloc[0]
+        else:
+            # Fallback if the reaction never drops to the 80% mark
+            auto_ae_time = df[time_col].iloc[-1]
+            
+    else:
+        # Use user inputs if they typed them into the table
+        auto_as_time = user_as_time
+        auto_ae_time = user_ae_time
 
+
+
+    # --- 4. FILTER DATA & CALCULATE SLOPE ---
+    v0_data = df[(df[time_col] >= auto_as_time) & (df[time_col] <= auto_ae_time)]
+    
+    # Make sure we have at least 2 points to draw a line
+    if len(v0_data) >= 2:
+        slope, intercept, r_value, p_value, std_err = linregress(v0_data[time_col], v0_data[abs_col])
+        r2 = r_value**2
+    else:
+        slope, intercept, r2 = 0.0, 0.0, 0.0
+
+    # Convert slope to V0. (Using absolute value because absorbance drops)
+    # Formula: (abs(slope) / (Epsilon * Path_Length)) * 1,000,000 to get µM
+    slope_abs = abs(slope)
+    v0_um_s = (slope_abs / (EPSILON * PATH_LENGTH)) * 1e6
+
+    # 5. Return everything the app needs to build the table and plots
     return {
         "filename": filename,
-        "pyruvate": pyr_val,
+        "pyruvate": pyruvate_val,
+        "enzyme_type": enzyme_type,
+        "as_time": auto_as_time,
+        "ae_time": auto_ae_time,
         "v0_um_s": v0_um_s,
-        "slope_abs_sec": final_reg.slope,
-        "intercept": final_reg.intercept,
-        "r2": final_reg.rvalue**2,
-        "as_time": df.iloc[as_idx]['Time'],
-        "ae_time": df.iloc[ae_idx]['Time'],
+        "slope_abs_sec": slope_abs,
+        "intercept": intercept,
+        "r2": r2,
         "v0_data": v0_data,
-        "full_df": df,
-        "enzyme_type": enzyme_type # Add enzyme type here
+        "full_df": df
     }
+
+
 
 def michaelis_menten(S, Vmax, Km):
     return (Vmax * S) / (Km + S)
@@ -172,6 +203,8 @@ if "v0_calculation_done" not in st.session_state:
     st.session_state.v0_calculation_done = False
 if "mm_plot_ready" not in st.session_state:
     st.session_state.mm_plot_ready = False # New state variable to control MM plot display
+if "inhibition_plot_ready" not in st.session_state:
+    st.session_state.inhibition_plot_ready = False
 
 # Initialize MM Plot Customization session state variables
 if "mm_plot_title" not in st.session_state:
@@ -216,6 +249,7 @@ if files:
         st.session_state.v0_calculated_results = [] # Clear V0 results as files changed
         st.session_state.v0_calculation_done = False
         st.session_state.mm_plot_ready = False # Reset MM plot ready state
+        st.session_state.inhibition_plot_ready = False
         st.session_state.uploaded_file_names = current_file_names
 
         for f in files:
@@ -310,7 +344,7 @@ if files:
                         "as_time": row['AS (sec)'],
                         "ae_time": row['AE (sec)'],
                         "v0_um_s": recalculated_res["v0_um_s"],
-                        "slope_abs_sec": recalculated_res["slope_abs_sec"],
+                        "slope_abs_sec": -recalculated_res["slope_abs_sec"],
                         "intercept": recalculated_res["intercept"],
                         "r2": recalculated_res["r2"],
                         "v0_data": recalculated_res["v0_data"]
@@ -373,8 +407,18 @@ if files:
                         st.pyplot(fig)
 
             # Button to initiate MM Plotting
-            if st.button("Initiate MM Plot"):
-                st.session_state.mm_plot_ready = True
+            st.divider()
+            col_btn1, col_btn2 = st.columns(2)
+            
+            with col_btn1:
+                if st.button("Initiate MM Plot", use_container_width=True):
+                    st.session_state.mm_plot_ready = True
+                    st.session_state.inhibition_plot_ready = False
+                    
+            with col_btn2:
+                if st.button("Initiate Inhibition Plot", use_container_width=True):
+                    st.session_state.inhibition_plot_ready = True
+                    st.session_state.mm_plot_ready = False
 
             # 4. MICHAELIS-MENTEN FIT (now conditional on mm_plot_ready)
             if st.session_state.mm_plot_ready:
@@ -556,6 +600,11 @@ if files:
                         print(f"Michaelis-Menten curve fit error: {e}") # Print the exception for debugging
                 else:
                     st.warning("Please include at least 2 runs (plus the implicit 0,0 point) to perform Michaelis-Menten fitting.")
+
+            # 5. INHIBITION PLOT
+            if st.session_state.inhibition_plot_ready:
+                st.subheader("🛑 Inhibition Plot")
+                st.info("Inhibition logic goes here. (Ready to group by inhibitor concentration or plot Lineweaver-Burk).")
 
 else:
     # If no files are uploaded, clear session state related to runs
